@@ -16,6 +16,26 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Artefact assertion (TASK-EST-247). `deploy` exports DEPLOY_SHA before
+      # BUILD; Guard 7 reads this label off the RUNNING container and will not
+      # call the deploy verified unless it equals the commit just pushed. Needed
+      # here because this target has NO HEALTH_URL either — without both, a
+      # `deploy worldmonitor` that rebuilt nothing (cached COPY layer, or `up -d`
+      # deciding the service was current and printing `Running`) is
+      # indistinguishable from one that shipped.
+      #
+      # ⚠️ Only the `worldmonitor` service is labelled, deliberately. The conf's
+      # RESTART is `docker compose up -d --build worldmonitor`, so redis and
+      # redis-rest are NOT recreated by a deploy — labelling them would pin a sha
+      # that then goes stale and makes Guard 7 report a permanent MISMATCH on
+      # correct deploys. Guard 7 judges only LABELLED containers, so leaving them
+      # unlabelled costs nothing. Label what the deploy actually replaces.
+      #
+      # ⚠️ `:-unset}` must stay a default, never a literal sha (that would assert
+      # the wrong commit forever — worse than asserting nothing), and
+      # `build.labels` is right only because this service has a `build:` stanza.
+      labels:
+        org.homelab.git-sha: "${DEPLOY_SHA:-unset}"
     image: worldmonitor:latest
     container_name: worldmonitor
     ports:
