@@ -1,0 +1,441 @@
+#!/bin/sh
+# Stray-branch guard (LOCAL hook — lives in the repo's hooks dir, never pushed).
+#
+# THE FAILURE THIS EXISTS FOR: `git push origin HEAD:main` in a repo whose
+# default is `master` does not fail. Git CREATES the branch and exits 0, so the
+# work is on a ref nobody deploys. `deploy` then hard-resets to the real default
+# and health-checks the OLD code — green light, nothing shipped. Real instance
+# 2026-08-03: gateway e47afc84 landed on a stray `main` while `master` sat at
+# cc60a303. Documented four separate times before this hook existed, which is the
+# argument for the hook: a rule in a doc cannot fail a command.
+#
+# WHAT IT REFUSES
+#   1. creating a NEW remote branch (the bug above) — unless it is a sanctioned
+#      prefix (feat/ fix/ chore/ docs/ rescue/ …) pushed with an explicit
+#      refspec, i.e. deliberate branch work rather than a typo'd default
+#   2. deleting the default branch
+#   3. a push from a repo whose own `scripts/test_*.sh` selftests FAIL
+#      (TASK-EST-207, added 2026-08-04 — see the selftest gate at the bottom of
+#      this file). A no-op in repos that have no such scripts, which today is all
+#      of them except homelab-infra.
+#
+# WHAT IT ALLOWS, always: updating an EXISTING remote branch (the normal ship
+# path, `git push origin HEAD:<default>`), and any push whose refs already exist.
+#
+# Escape hatches, and each waives ONLY its own rule — see the note at the
+# PUSH_NEW_BRANCH_OK check, which until 2026-08-05 waived rule 3 as well:
+#   PUSH_NEW_BRANCH_OK=1 git push …   (rules 1–2; selftests STILL run)
+#   SKIP_SELFTESTS=1 git push …       (rule 3 only)
+#
+# Reads stdin per githooks(5): "<local ref> <local sha> <remote ref> <remote sha>",
+# and a remote sha of all-zeros means THE REMOTE REF DOES NOT EXIST YET = a
+# create. That is the whole detection; it needs no network call, so the hook
+# cannot fail closed just because GitHub is slow or a laptop is offline.
+#
+# ⚠ INSTALL LOCATION IS PER-REPO. `.git/hooks` is only right when
+# core.hooksPath is unset — jarvis-hq uses `.husky`, jarvis-nanoclaw uses
+# `.githooks`, and a hook dropped in `.git/hooks` there is SILENTLY IGNORED
+# (which would read as "installed and passing"). Use install-guards.sh, which
+# resolves the path with `git rev-parse --git-path hooks`.
+
+# A pre-existing ("foreign") hook is moved to pre-push.local and delegated to at
+# the end of this file — NOT appended after us.
+#
+# ⚠ Appending was the first design and it was silently broken. githooks(5) feeds
+# the ref list on STDIN, and a foreign hook that ends in `exit 0` (husky's stub
+# does; so does any `set -e` script that exits early) terminates the process
+# before an appended block is ever reached. Verified on a throwaway rig
+# 2026-08-04: `git push origin HEAD:main` in a master repo returned
+# `* [new branch]`, exit 0, with a perfectly good guard sitting below the exit.
+# A guard that reports "installed" and never runs is worse than none.
+#
+# Because stdin is a PIPE and can only be read once, we buffer it here and
+# replay it to the delegate.
+remote_name="$1"
+zero='0000000000000000000000000000000000000000'
+hooks_dir=$(dirname "$0")
+
+# Buffer the ref list to a FILE, not a variable piped into the loop below:
+# `... | while read` runs the loop in a SUBSHELL, so a `status=1` set inside it
+# is discarded when the subshell exits and the hook returns 0. Redirecting from
+# a file keeps the loop in this shell.
+refs_file=$(mktemp) || exit 1
+trap 'rm -f "$refs_file"' EXIT HUP INT TERM
+cat > "$refs_file"
+
+delegate() {   # run the foreign hook, if any, with the SAME stdin we consumed
+  if [ -x "$hooks_dir/pre-push.local" ]; then
+    "$hooks_dir/pre-push.local" "$@" < "$refs_file"
+    return $?
+  fi
+  return 0
+}
+
+# ⚠️ This waives rules 1–2 ONLY, and it used to `delegate; exit $?` right here —
+# which sat ABOVE the selftest gate and therefore waived RULE 3 TOO, silently.
+# One env var named after the branch rule was disabling the test rule as well:
+# measured 2026-08-05 in ailab, a push carrying a deliberately-failing
+# scripts/test_zz_gate_canary.sh was ACCEPTED (`* [new branch]`) with
+# PUSH_NEW_BRANCH_OK=1 set, and the canary never executed. The same push without
+# the var was correctly refused. So every `rescue/…` or `feat/…` branch pushed
+# with the hatch — the exact pushes made while something is already going wrong —
+# skipped the tests, and the escape hatch you reach for under pressure is the one
+# that must waive the least.
+#
+# It also made this file's own canary a liar: my first attempt to prove the gate
+# refuses used the hatch to get past rule 1, so it "passed" for a reason that had
+# nothing to do with the gate. A CHECK YOU CANNOT SEE FAIL IS NOT A CHECK — and a
+# canary that trips a DIFFERENT rule than the one under test proves nothing.
+# Anything added below must be canaried with the hatch BOTH set and unset.
+skip_branch_rules=''
+[ "${PUSH_NEW_BRANCH_OK:-}" = "1" ] && skip_branch_rules=1
+
+# The default branch, resolved WITHOUT the network: the local origin/HEAD cache
+# if it exists, else the checkout's own branch as a best guess. Only used for the
+# advisory message and the delete check — never to decide rule 1, so a missing
+# origin/HEAD cannot make this hook wrong.
+default=$(git symbolic-ref --quiet --short "refs/remotes/${remote_name}/HEAD" 2>/dev/null | sed "s|^${remote_name}/||")
+[ -z "$default" ] && default=$(git config "branch.$(git symbolic-ref --short HEAD 2>/dev/null).merge" 2>/dev/null | sed 's|^refs/heads/||')
+
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "$skip_branch_rules" ] && continue     # hatch: rules 1–2 waived, rule 3 still applies
+  [ -z "$remote_ref" ] && continue
+  case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac   # tags/notes: not our business
+  short_remote=${remote_ref#refs/heads/}
+
+  # Deleting the default branch.
+  if [ "$local_sha" = "$zero" ]; then
+    if [ -n "$default" ] && [ "$short_remote" = "$default" ]; then
+      echo "✗ REFUSED: that would DELETE the default branch '$short_remote'." >&2
+      status=1
+    fi
+    continue
+  fi
+
+  # Creating a remote branch that does not exist yet.
+  if [ "$remote_sha" = "$zero" ]; then
+    case "$short_remote" in
+      feat/*|fix/*|chore/*|docs/*|perf/*|refactor/*|test/*|ci/*|rescue/*)
+        continue ;;   # deliberate branch work — a typo'd default never looks like this
+    esac
+    echo "" >&2
+    echo "✗ REFUSED: this push would CREATE a new remote branch '$short_remote'." >&2
+    if [ -n "$default" ] && [ "$short_remote" != "$default" ]; then
+      echo "  This repo's default branch is '$default'. Did you mean:" >&2
+      echo "" >&2
+      echo "      git push $remote_name HEAD:$default" >&2
+      echo "" >&2
+      echo "  Pushing to the WRONG name succeeds silently and ships nothing:" >&2
+      echo "  deploy resets to '$default' and health-checks the old code green." >&2
+    else
+      echo "  Bare top-level branch names are reserved for defaults." >&2
+      echo "  Use a prefix (feat/… fix/… docs/…) for branch work." >&2
+    fi
+    echo "  Deliberate? PUSH_NEW_BRANCH_OK=1 git push $remote_name HEAD:$short_remote" >&2
+    echo "  Rules: homelab-docs AGENTS.md §4b" >&2
+    echo "" >&2
+    status=1
+  fi
+done < "$refs_file"
+
+# --- selftest gate (TASK-EST-207) ----------------------------------------------
+#
+# THE FAILURE THIS EXISTS FOR: `homelab-infra/scripts/test_*.sh` grew to SIX
+# committed harnesses that NOTHING ran — no hook, no `deploy` step, no CI (this
+# repo has no .github/ at all). Each was written as the answer to "a check only
+# ever observed passing is indistinguishable from no check", and then inherited
+# that same defect one layer up.
+#
+# It is not hypothetical. MEASURED 2026-08-04, before this gate existed:
+# `test_exec_bits_check.sh` was RED on the deploy checkout (3 passed, 1 failed)
+# and had been since commit 3028792 — a *correct* improvement to the check (it
+# learned to discover deploy.d BUILD paths) broke a selftest that hardcoded
+# "1 of 1". Nobody knew, because nobody ran it. A red test that nothing executes
+# is worse than no test: it is a false claim of coverage sitting in git.
+#
+# WHY pre-push AND NOT deploy. `deploy` runs AFTER the push, and GitHub is the
+# source of truth — by then the bad commit is already the thing every other
+# checkout will fast-forward to. pre-push is the last point where a failing
+# harness can still stop the commit from becoming canonical.
+#
+# WHY THIS IS SAFE TO PUT IN EVERY REPO's HOOK: it is a no-op unless the repo
+# being pushed HAS a scripts/test_*.sh. Only homelab-infra does today, so this
+# costs every other repo one glob. Total runtime here, measured: 10.6s for all
+# six (blocked-commit 1.4s, conf-reload 0.5s, deploy-remote 2.0s, sibling-guard
+# 2.5s, exec-bits 0.5s, iptv 3.8s).
+#
+# ⚠️ 3.8s, not the ~20s I had claimed. The "IPTV selftest is too slow to gate on"
+# objection that kept TASK-EST-207 open was inherited and never timed. Measure
+# the cost before designing around it.
+#
+# Escape hatches, both deliberate:
+#   SKIP_SELFTESTS=1 git push …   — explicit, one push
+#   a harness that is itself broken can be fixed and pushed with the above
+#
+# ⚠️ The harnesses must stay OFFLINE and hermetic. Every one of the six builds its
+# fixtures under `mktemp -d` (or ~/.cache) with local bare remotes and stubs
+# `crontab`/`sudo` on PATH; none touches the network. A harness that reached
+# github.com would make every push fail when the network is slow — fail-closed on
+# something unrelated to the change. If you add one that needs a network, it does
+# not belong in this gate.
+if [ "$status" -eq 0 ] && [ "${SKIP_SELFTESTS:-}" != "1" ]; then
+  # The repo root, resolved from the hooks dir rather than $PWD: git runs hooks
+  # from the toplevel today, but a future `git -C` invocation or a worktree push
+  # must not silently turn this into a glob over the wrong tree (which would find
+  # no tests and pass — a false green, the failure mode this whole file fights).
+  gate_root=$(git rev-parse --show-toplevel 2>/dev/null)
+
+  # ── DON'T RUN WHAT THE DEPLOY IS ABOUT TO RUN ANYWAY ─────────────────────
+  #
+  # Measured 2026-08-09: this gate exceeded 120 s in ailab, and `deploy ailab`
+  # then ran the same 28 suites again as its BUILD step. Two full runs per ship.
+  # (The push itself is not slow: `ls-remote` answers in 738 ms.)
+  #
+  # ⚠️ Skipping here does let a red suite reach origin/main — but NOT the running
+  # container: `deploy` is `set -e` with BUILD before RESTART, so it still
+  # refuses. The alternative was SKIP_SELFTESTS=1, which waives the gate for
+  # every repo including the ones it protects.
+  #
+  # CONSERVATIVE by design: the repo must have a deploy.d/<repo>.conf AND its
+  # BUILD line must name a test runner. Anything unclear runs the suites.
+  # homelab-infra is why: 10 harnesses, BUILD=install-live-scripts.sh runs none
+  # of them, so this gate is their only runner. Verified 2026-08-09 — of 12
+  # confs, only ailab both has harnesses and runs them in BUILD.
+  #
+  # FORCE_SELFTESTS=1 runs them regardless.
+  #
+  # ⚠️⚠️ THE REPO NAME IS **NOT** `basename $gate_root`, AND THAT BUG SHIPPED.
+  # This said basename on its first push (2026-08-09) and the very next real push
+  # ran all 28 suites anyway — because every push on this estate comes from a
+  # WORKTREE, whose toplevel is the SLUG (`h3-advance`), not the repo. It looked
+  # for `deploy.d/h3-advance.conf`, found nothing, and correctly took the
+  # conservative path. So the fix was a no-op exactly where it was meant to apply,
+  # and it FAILED SAFE — the suites ran, everything passed, nothing warned. Only
+  # the elapsed time gave it away.
+  #
+  # `--git-common-dir` is the linked worktree's MAIN .git, so its parent is the
+  # deploy checkout — which is what deploy.d confs are named after. Verified
+  # 2026-08-09 across ailab + homelab-infra, each as a plain checkout AND as a
+  # worktree: all four resolve correctly. The origin URL agrees in all four and is
+  # the fallback, for a checkout living outside /opt/homelab.
+  gate_delegated=''
+  if [ -n "$gate_root" ] && [ "${FORCE_SELFTESTS:-}" != "1" ]; then
+    gate_common=$(cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd)
+    gate_repo=''
+    [ -n "$gate_common" ] && gate_repo=$(basename "$(dirname "$gate_common")")
+    # Fall back to the remote URL, then to the dir name, rather than to nothing:
+    # an unresolvable name must run the suites, never skip them.
+    [ -n "$gate_repo" ] || gate_repo=$(basename -s .git "$(git remote get-url origin 2>/dev/null)" 2>/dev/null)
+    [ -n "$gate_repo" ] || gate_repo=$(basename "$gate_root")
+    gate_conf="/opt/homelab/homelab-infra/deploy.d/$gate_repo.conf"
+    if [ -f "$gate_conf" ] \
+       && grep -q '^BUILD=.*\(run-tests\|scripts/test\|run_tests\)' "$gate_conf"; then
+      gate_delegated=1
+      echo "pushguard: selftests deferred to \`deploy $gate_repo\`, which runs them"
+      echo "           as its BUILD step and REFUSES the deploy if any fail."
+      echo "           (FORCE_SELFTESTS=1 git push … to run them here as well)"
+    fi
+  fi
+
+  if [ -n "$gate_root" ] && [ -z "$gate_delegated" ] && [ -d "$gate_root/scripts" ]; then
+    gate_failed=''
+    gate_ran=0
+    for t in "$gate_root"/scripts/test_*.sh; do
+      [ -f "$t" ] || continue          # glob did not match: no tests, nothing to do
+      gate_ran=$((gate_ran + 1))
+      # `sh "$t"` would be wrong: these are #!/usr/bin/env bash and use arrays and
+      # pipefail. Honour the shebang by executing the file — and if the exec bit is
+      # missing (core.fileMode=false hides chmod from git, the TASK-EST-098 bug
+      # that killed three crons), fall back to bash rather than reporting a pass.
+      #
+      # ⚠️⚠️ `env -u GIT_DIR …` IS LOAD-BEARING, AND OMITTING IT BROKE THE FIRST
+      # LIVE PUSH THROUGH THIS GATE. `git push` EXPORTS GIT_DIR (and friends) to its
+      # hooks, and those variables are INHERITED BY EVERY CHILD PROCESS. Each
+      # harness builds a throwaway fixture repo under mktemp and runs `git -C
+      # "$fixture" …` against it — but an inherited GIT_DIR overrides `-C`, so all
+      # those commands silently operated on THIS repo instead of the fixture.
+      # Measured: 4 of 6 harnesses passed standalone and failed inside the hook,
+      # blocking their own correct commit. The harnesses were right; the gate was
+      # wrong.
+      #
+      # This is the same class as the two traps already recorded in these files (a
+      # broken fixture reads exactly like a broken check; a hook that never runs
+      # reads exactly like a hook that passes): AN ENVIRONMENT DIFFERENCE BETWEEN
+      # "run it by hand" AND "run it for real" MAKES A GREEN TEST MEANINGLESS IN
+      # BOTH DIRECTIONS. Anything added here must be exercised by a real `git push`,
+      # not just by running the harness in a terminal.
+      git_env="GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+               GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_COMMON_DIR
+               GIT_QUARANTINE_PATH GIT_INTERNAL_SUPER_PREFIX"
+      # shellcheck disable=SC2086
+      unset_args=''
+      for v in $git_env; do unset_args="$unset_args -u $v"; done
+      if [ -x "$t" ]; then out=$(env $unset_args "$t" 2>&1); rc=$?
+      else                 out=$(env $unset_args bash "$t" 2>&1); rc=$?
+      fi
+      if [ "$rc" -ne 0 ]; then
+        gate_failed="$gate_failed $(basename "$t")"
+        echo "" >&2
+        echo "✗ SELFTEST FAILED: $(basename "$t") (exit $rc)" >&2
+        printf '%s\n' "$out" | tail -15 | sed 's/^/    /' >&2
+      fi
+    done
+    if [ -n "$gate_failed" ]; then
+      echo "" >&2
+      echo "✗ REFUSED: $gate_ran selftest(s) run, these failed:$gate_failed" >&2
+      echo "  These are committed harnesses for the silent-failure checks and for" >&2
+      echo "  \`deploy\`. A red one means either the check regressed or the harness's" >&2
+      echo "  own assertion went stale — find out which BEFORE pushing." >&2
+      echo "  Run it directly for the full output:" >&2
+      echo "" >&2
+      for f in $gate_failed; do echo "      $gate_root/scripts/$f" >&2; done
+      echo "" >&2
+      echo "  Deliberate? SKIP_SELFTESTS=1 git push …" >&2
+      echo "  Rules: homelab-docs AGENTS.md §4c · TASK-EST-207" >&2
+      echo "" >&2
+      status=1
+    elif [ "$gate_ran" -gt 0 ]; then
+      echo "✓ $gate_ran selftest(s) passed" >&2
+    fi
+  fi
+fi
+# --- end selftest gate ---------------------------------------------------------
+
+# --- canon gate (B3.3, CANON-GOVERNANCE-SPEC §2) --------------------------------
+#
+# THE FAILURE THIS EXISTS FOR: the canon (ESTATE-CANON.md + topology.yaml in
+# homelab-docs) rots because infra facts change in code and nobody updates the
+# narrative — the 2026-08 audit found the mac-bridge on two different IPs in two
+# committed diagrams, model docs describing a disabled pool, and a persona roster
+# nobody could count. A rule in a doc cannot fail a command, so this is the
+# command: a push whose diff touches the LOAD-BEARING set (the files whose change
+# almost always changes a canon fact) must ALSO touch the canon, or say why not.
+#
+# WARN-BY-DEFAULT, BLOCK ON THE LOAD-BEARING SET. A hard block on every push
+# trains `--no-verify` bypasses; the block is reserved for the file set that is
+# nearly always a canon fact. Everything merely infra-ish gets one non-blocking
+# warning line. The drift cron (silent-failure-watch) is the net for whatever
+# slips past.
+#
+# HOW TO SATISFY IT, any one of:
+#   1. the same push touches ESTATE-CANON.md or topology.yaml (matched by
+#      basename, so the homelab-docs originals AND the jarvis-hq docs/canon/
+#      copies both count);
+#   2. a commit body line `canon: n/a` — this change alters no canon fact;
+#   3. a commit body line `canon: updated …` — the canon change shipped in
+#      homelab-docs separately (cross-repo pushes cannot carry both files);
+#   4. SKIP_CANON_GATE=1 git push …  (one push, explicit).
+#
+# OFFLINE-SAFE AND FAIL-OPEN BY DESIGN: everything here is local (`git diff`
+# between shas already in the object store). If the base of a created branch
+# cannot be resolved without the network, the gate SKIPS rather than blocks —
+# a canon reminder must never be the reason a push fails on a plane. Note the
+# PUSH_NEW_BRANCH_OK hatch does NOT waive this gate (see the 2026-08-05 lesson
+# above: one hatch must waive one rule).
+if [ "$status" -eq 0 ] && [ "${SKIP_CANON_GATE:-}" != "1" ]; then
+  # Which canon section a load-bearing file maps to. Prints the section and
+  # returns 0 on a match; returns 1 for everything else.
+  canon_lb_section() {
+    case "$1" in
+      compose/*docker-compose.yml|*/compose/*docker-compose.yml)
+        echo "ESTATE-CANON.md §5 FOUNDATION + topology.yaml services" ;;
+      deploy.d/*.conf|*/deploy.d/*.conf)
+        echo "topology.yaml services (+ ESTATE-CANON.md §5)" ;;
+      config/systemd/*|*/config/systemd/*)
+        echo "ESTATE-CANON.md §5 FOUNDATION (units)" ;;
+      *capabilityRouter.ts|*localModelRegistry.ts|*mlxFleet.ts)
+        echo "ESTATE-CANON.md §4 THE MINDS + topology.yaml models" ;;
+      config/mlx-pool/*|*/config/mlx-pool/*)
+        echo "ESTATE-CANON.md §4 THE MINDS + topology.yaml pool" ;;
+      config/traefik-rules/*|*/config/traefik-rules/*)
+        echo "ESTATE-CANON.md §5 edge (Cloudflare→Traefik→Authelia)" ;;
+      *src/db/migrations/*)
+        echo "ESTATE-CANON.md §3 THE STAFF (container_configs / schema)" ;;
+      *personas/*|*call-personas.js|*call-personas.json|*groups/*/CLAUDE.md)
+        echo "ESTATE-CANON.md §3 THE STAFF (persona roster)" ;;
+      *) return 1 ;;
+    esac
+  }
+
+  canon_block=''
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "$remote_ref" ] && continue
+    case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac
+    [ "$local_sha" = "$zero" ] && continue          # a delete lands no files
+
+    # The diff base: the remote's current tip when we have it locally; for a
+    # CREATE (or a remote tip we never fetched) fall back to the merge-base with
+    # the cached default — still no network. Unresolvable → skip, fail open.
+    canon_base="$remote_sha"
+    if [ "$canon_base" = "$zero" ] \
+       || ! git rev-parse --quiet --verify "$canon_base^{commit}" >/dev/null 2>&1; then
+      canon_base=''
+      [ -n "$default" ] && canon_base=$(git merge-base "$local_sha" \
+        "refs/remotes/${remote_name}/${default}" 2>/dev/null)
+    fi
+    [ -z "$canon_base" ] && continue
+    [ "$canon_base" = "$local_sha" ] && continue    # nothing new on this ref
+
+    canon_files=$(git diff --name-only "$canon_base" "$local_sha" 2>/dev/null)
+    [ -z "$canon_files" ] && continue
+
+    canon_touched=''
+    canon_lb=''
+    canon_warn=''
+    # Set IFS to newline only for the split; paths with spaces stay whole.
+    canon_oldifs=$IFS; IFS='
+'
+    for canon_f in $canon_files; do
+      case "${canon_f##*/}" in
+        ESTATE-CANON.md|topology.yaml) canon_touched=1 ;;
+      esac
+      if canon_sect=$(canon_lb_section "$canon_f"); then
+        canon_lb="$canon_lb
+      $canon_f
+          → update: $canon_sect"
+      else
+        case "$canon_f" in
+          compose/*|config/*|deploy.d/*|*/crontabs/*|*.service)
+            canon_warn="$canon_warn $canon_f" ;;
+        esac
+      fi
+    done
+    IFS=$canon_oldifs
+
+    if [ -n "$canon_lb" ] && [ -z "$canon_touched" ]; then
+      # Last chance: an explicit `canon:` trailer anywhere in the pushed range.
+      if git log --format=%B "$canon_base..$local_sha" 2>/dev/null \
+           | grep -qiE '^canon:[[:space:]]*(n/a|updated)'; then
+        echo "✓ canon gate: load-bearing change carries a canon: trailer" >&2
+      else
+        canon_block=1
+        echo "" >&2
+        echo "✗ REFUSED: load-bearing files changed and the canon did not (canon gate)." >&2
+        echo "  These files nearly always change a canon fact:" >&2
+        echo "$canon_lb" >&2
+        echo "" >&2
+        echo "  Fix one of these ways:" >&2
+        echo "   · update audits/ESTATE-CANON.md / audits/topology.yaml (homelab-docs)" >&2
+        echo "     in this same push, or" >&2
+        echo "   · no canon fact changed? add a commit body line:   canon: n/a" >&2
+        echo "   · canon updated in homelab-docs separately? add:   canon: updated <what>" >&2
+        echo "  Escape hatch (this push only): SKIP_CANON_GATE=1 git push …" >&2
+        echo "  Spec: homelab-docs audits/CANON-GOVERNANCE-SPEC.md §2 · ESTATE-CANON.md §8" >&2
+        echo "" >&2
+      fi
+    elif [ -n "$canon_warn" ] && [ -z "$canon_touched" ]; then
+      echo "⚠ canon gate (warn only): infra-ish files changed, canon untouched:$canon_warn" >&2
+      echo "  If a host/service/model/persona fact changed, update ESTATE-CANON.md/topology.yaml." >&2
+    fi
+  done < "$refs_file"
+  [ -n "$canon_block" ] && status=1
+fi
+# --- end canon gate --------------------------------------------------------------
+
+# Our verdict first: if we refuse, the foreign hook's opinion cannot rescue the
+# push. If we pass, the foreign hook still gets to refuse (it may run tests or
+# lint), and its exit status becomes ours.
+[ "$status" -ne 0 ] && exit "$status"
+delegate "$@"
+exit $?
